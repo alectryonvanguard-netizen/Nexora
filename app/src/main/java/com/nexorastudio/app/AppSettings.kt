@@ -1,5 +1,5 @@
 package com.nexorastudio.app
-app/src/main/java/com/example/nexorastudio/
+
 import android.content.Context
 
 class AppSettings(ctx: Context) {
