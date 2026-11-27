@@ -1,3 +1,4 @@
+
 package com.nexorastudio.app
 
 import android.app.Application
@@ -33,6 +34,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     val settings = AppSettings(app)
     val store = ProjectStore(app)
+    private val historyStore = HistoryStore(app)
+
     private val videoEngine = VideoEngine(app)
     private val main = Handler(Looper.getMainLooper())
 
@@ -75,6 +78,25 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private var lastVideo: Uri? = null
     private val codeTurns = mutableListOf<Turn>()
     private val generalTurns = mutableListOf<Turn>()
+
+    // ------------------------------------------------------------------ HISTORY
+
+    fun historyEntries(): List<HistoryEntry> = historyStore.list()
+
+    fun deleteChat(id: String) {
+        historyStore.delete(id)
+    }
+
+    fun openChat(id: String): Boolean {
+        val chat = historyStore.load(id) ?: return false
+
+        newChat()
+        items.addAll(chat.messages)
+
+        counter = (chat.messages.maxOfOrNull { it.id } ?: -1L) + 1L
+
+        return true
+    }
 
     override fun onCleared() {
         speaker.shutdown()
