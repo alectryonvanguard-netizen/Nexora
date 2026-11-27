@@ -6,6 +6,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -30,6 +31,9 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
     companion object {
         const val CHAT_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
         const val STATUS_URL = "https://api.nvcf.nvidia.com/v2/nvcf/pexec/status/"
+
+        /** Public list of models NVIDIA serves right now, fetched once per app run. */
+        @Volatile var cachedModels: Set<String>? = null
     }
 
     // ---------------------------------------------------------------- chat (Kimi, streaming)
@@ -116,6 +120,52 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
         throw ApiException(408, "The model took too long to answer. Please try again.")
     }
 
+    /**
+     * Tries the models in order and skips any that NVIDIA has retired (HTTP 410 or 404).
+     * Models missing from NVIDIA's public model list are skipped without a request.
+     */
+    suspend fun streamChatAuto(
+        candidates: List<String>,
+        messages: List<ChatMsg>,
+        effort: String,
+        maxTokens: Int = 32000,
+        onThinking: () -> Unit = {},
+        onDelta: (String) -> Unit = {}
+    ): String {
+        val listed = availableModels()
+        val all = candidates.map { it.trim() }.filter { it.isNotEmpty() }.distinct()
+        val ordered = if (listed.isEmpty()) all else all.filter { it in listed }.ifEmpty { all }
+        var last: ApiException? = null
+        for (m in ordered) {
+            try {
+                return streamChat(m, messages, effort, maxTokens, onThinking, onDelta)
+            } catch (e: ApiException) {
+                if (e.code == 404 || e.code == 410 || e.code == 400 || e.code == 422) last = e else throw e
+            }
+        }
+        throw ApiException(
+            410,
+            "None of the chat models are available right now (${last?.message ?: "no answer"}). Open Settings and type a current model id from build.nvidia.com/models."
+        )
+    }
+
+    private suspend fun availableModels(): Set<String> {
+        cachedModels?.let { return it }
+        return try {
+            val req = Request.Builder().url("https://integrate.api.nvidia.com/v1/models").get().build()
+            val body = withTimeoutOrNull(6000) {
+                withContext(Dispatchers.IO) { exec(req) { r -> if (r.isSuccessful) r.body?.string().orEmpty() else "" } }
+            } ?: ""
+            val data = JSONObject(body).getJSONArray("data")
+            val set = HashSet<String>()
+            for (i in 0 until data.length()) set.add(data.getJSONObject(i).getString("id"))
+            cachedModels = set
+            set
+        } catch (e: Exception) {
+            emptySet()
+        }
+    }
+
     private fun toJson(m: ChatMsg): JSONObject {
         val o = JSONObject().put("role", m.role)
         if (m.images.isEmpty()) {
@@ -175,7 +225,7 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
     }
 
     private suspend fun postImage(model: String, payload: JSONObject): ByteArray {
-        val name = model.trim().replace("flux-3-image-klein", "flux.3-image-klein")
+        val name = model.trim().replace("flux.3-image-klein", "flux-3-image-klein")
         val base = settings.imageBase.trim().let { if (it.endsWith("/")) it else "$it/" }
         val req = Request.Builder()
             .url(base + name)
