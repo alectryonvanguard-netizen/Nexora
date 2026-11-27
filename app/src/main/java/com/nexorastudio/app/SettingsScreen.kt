@@ -6,6 +6,8 @@ import android.webkit.WebViewClient
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -26,6 +28,9 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -68,17 +73,22 @@ private fun TopBar(title: String, onBack: () -> Unit, actions: @Composable () ->
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun SettingsScreen(vm: StudioViewModel, onBack: () -> Unit) {
     val s = vm.settings
     var key by remember { mutableStateOf(s.apiKey) }
     var show by remember { mutableStateOf(false) }
     var chat by remember { mutableStateOf(s.chatModel) }
+    var fast by remember { mutableStateOf(s.fastModel) }
+    var vision by remember { mutableStateOf(s.visionModel) }
     var gen by remember { mutableStateOf(s.genModel) }
     var edit by remember { mutableStateOf(s.editModel) }
     var base by remember { mutableStateOf(s.imageBase) }
     var effort by remember { mutableStateOf(s.effort) }
     var steps by remember { mutableFloatStateOf(s.steps.toFloat()) }
+    var accent by remember { mutableStateOf(s.accentTag) }
+    var auto by remember { mutableStateOf(s.autoLanguage) }
 
     Column(Modifier.fillMaxSize().systemBarsPadding()) {
         TopBar("SETTINGS", onBack)
@@ -104,13 +114,41 @@ fun SettingsScreen(vm: StudioViewModel, onBack: () -> Unit) {
             Text("Free key from build.nvidia.com. Stored only on this device.", color = InkDim, fontSize = 12.sp)
 
             Text("MODELS", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
-            OutlinedTextField(chat, { chat = it; s.chatModel = it }, label = { Text("Chat, code and vision model") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(chat, { chat = it; s.chatModel = it }, label = { Text("Main model (code and video editing)") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(fast, { fast = it; s.fastModel = it }, label = { Text("Fast chat model") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
+            OutlinedTextField(vision, { vision = it; s.visionModel = it }, label = { Text("Fast vision model (live camera, screen)") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
             OutlinedTextField(gen, { gen = it; s.genModel = it }, label = { Text("Image generation model") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
             OutlinedTextField(edit, { edit = it; s.editModel = it }, label = { Text("Image editing model") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
             OutlinedTextField(base, { base = it; s.imageBase = it }, label = { Text("Image API base URL") }, singleLine = true, colors = fieldColors(), modifier = Modifier.fillMaxWidth())
             Text("Point the base URL at your own FLUX NIM if the hosted preview limits image editing.", color = InkDim, fontSize = 12.sp)
 
-            Text("REASONING EFFORT", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
+            Text("Normal chat uses the fast chat model. Pictures, the live camera and screen sharing use the fast vision model. The main model is for code and video editing. If a model is slow or unavailable, type another NVIDIA model id here.", color = InkDim, fontSize = 12.sp)
+
+            Text("LANGUAGE AND ACCENT", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("Reply in the language I write", color = Ink, fontSize = 14.sp, modifier = Modifier.weight(1f))
+                Switch(
+                    checked = auto,
+                    onCheckedChange = { auto = it; s.autoLanguage = it },
+                    colors = SwitchDefaults.colors(checkedTrackColor = Ink, checkedThumbColor = Color(0xFF05060A))
+                )
+            }
+            Text(
+                if (auto) "Pick the accent for the voice and for English spelling." else "NEXORA will always reply in the language you pick below.",
+                color = InkDim, fontSize = 12.sp
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Accents.tags.forEach { tag ->
+                    FilterChip(
+                        selected = accent == tag,
+                        onClick = { accent = tag; s.accentTag = tag },
+                        label = { Text(Accents.name(tag)) }
+                    )
+                }
+            }
+            TextButton(onClick = { vm.previewVoice() }) { Text("TEST VOICE", color = Ink, letterSpacing = 2.sp) }
+
+            Text("CODE REASONING EFFORT", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
             Row {
                 listOf("low", "medium", "high").forEach { e ->
                     FilterChip(selected = effort == e, onClick = { effort = e; s.effort = e }, label = { Text(e) })
