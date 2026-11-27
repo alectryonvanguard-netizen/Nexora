@@ -151,12 +151,14 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             speakingId = null
             return
         }
-        val err = speaker.speak(text, settings.accentTag)
+        val err = speaker.speak(text, settings.accentTag, settings.voiceName)
         if (err != null) toast(err) else speakingId = id
     }
 
+    fun voiceOptions(tag: String): List<VoiceOption> = speaker.voices(tag)
+
     fun previewVoice() {
-        val err = speaker.speak(Accents.sample(settings.accentTag), settings.accentTag)
+        val err = speaker.speak(Accents.sample(settings.accentTag), settings.accentTag, settings.voiceName)
         if (err != null) toast(err)
     }
 
