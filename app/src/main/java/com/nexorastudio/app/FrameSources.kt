@@ -7,6 +7,8 @@ import android.os.SystemClock
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.core.UseCase
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
@@ -20,8 +22,8 @@ object FrameHub {
 }
 
 /**
- * Uses the camera in the background: no preview is shown on screen.
- * It only keeps the newest small frame in [FrameHub.camera] (about one per second).
+ * Uses the camera and keeps only the newest small frame in [FrameHub.camera] (about one per second).
+ * Without a preview provider nothing is shown on screen. With one, the camera is also displayed.
  */
 class CameraFrames(private val ctx: Context) {
     private var provider: ProcessCameraProvider? = null
@@ -29,19 +31,29 @@ class CameraFrames(private val ctx: Context) {
 
     @Volatile private var lastTs = 0L
 
-    fun start(owner: LifecycleOwner, front: Boolean, onResult: (Boolean, String?) -> Unit) {
+    private val analysis: ImageAnalysis = ImageAnalysis.Builder()
+        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+        .build()
+        .also { it.setAnalyzer(executor) { proxy -> handle(proxy) } }
+
+    fun start(
+        owner: LifecycleOwner,
+        front: Boolean,
+        previewProvider: Preview.SurfaceProvider?,
+        onResult: (Boolean, String?) -> Unit
+    ) {
         val future = ProcessCameraProvider.getInstance(ctx)
         future.addListener({
             try {
                 val p = future.get()
                 provider = p
                 p.unbindAll()
-                val analysis = ImageAnalysis.Builder()
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
-                analysis.setAnalyzer(executor) { proxy -> handle(proxy) }
                 val selector = if (front) CameraSelector.DEFAULT_FRONT_CAMERA else CameraSelector.DEFAULT_BACK_CAMERA
-                p.bindToLifecycle(owner, selector, analysis)
+                val useCases = mutableListOf<UseCase>(analysis)
+                if (previewProvider != null) {
+                    useCases.add(Preview.Builder().build().also { it.setSurfaceProvider(previewProvider) })
+                }
+                p.bindToLifecycle(owner, selector, *useCases.toTypedArray())
                 onResult(true, null)
             } catch (e: Exception) {
                 onResult(false, "Could not open the camera: ${e.message}")
