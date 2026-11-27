@@ -18,7 +18,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.viewmodel.compose.viewModel
 
-enum class Screen { STUDIO, SETTINGS, PREVIEW }
+enum class Screen { STUDIO, SETTINGS, PREVIEW, LIVE }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -32,7 +32,7 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun NexoraApp(vm: StudioViewModel = viewModel()) {
+fun NexoraApp(vm: StudioViewModel = viewModel(), live: LiveViewModel = viewModel()) {
     var screen by rememberSaveable { mutableStateOf(Screen.STUDIO) }
     var project by rememberSaveable { mutableStateOf("") }
 
@@ -47,10 +47,12 @@ fun NexoraApp(vm: StudioViewModel = viewModel()) {
                 Screen.STUDIO -> StudioScreen(
                     vm = vm,
                     onSettings = { screen = Screen.SETTINGS },
+                    onLive = { screen = Screen.LIVE },
                     onPreview = { project = it; screen = Screen.PREVIEW }
                 )
                 Screen.SETTINGS -> SettingsScreen(vm) { screen = Screen.STUDIO }
                 Screen.PREVIEW -> PreviewScreen(vm, project) { screen = Screen.STUDIO }
+                Screen.LIVE -> LiveScreen(live) { screen = Screen.STUDIO }
             }
         }
     }
