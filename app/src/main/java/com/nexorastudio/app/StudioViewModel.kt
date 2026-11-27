@@ -141,7 +141,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
                 ),
                 ChatMsg("user", ReplyStyle.clean(sourceText))
             )
-            streamReply(api, msgs, 3000, settings.fastModel)
+            streamReply(api, msgs, 3000, settings.fastCandidates())
         }
     }
 
@@ -216,15 +216,15 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Streams one reply into the chat with a typing bubble. Returns the full text. */
-    private suspend fun streamReply(api: NvidiaApi, msgs: List<ChatMsg>, maxTokens: Int, model: String): String {
+    private suspend fun streamReply(api: NvidiaApi, msgs: List<ChatMsg>, maxTokens: Int, models: List<String>): String {
         status = "Thinking…"
         val id = nid()
         items.add(AiMsg(id, Mode.GENERAL, "", true))
         val idx = items.lastIndex
         val sb = StringBuilder()
         var last = 0L
-        val full = api.streamChat(
-            model = model,
+        val full = api.streamChatAuto(
+            candidates = models,
             messages = msgs,
             effort = "low",
             maxTokens = maxTokens,
@@ -253,8 +253,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             generalTurns.takeLast(6).forEach { add(ChatMsg("user", it.user)); add(ChatMsg("assistant", it.assistant)) }
             add(ChatMsg("user", if (images.isEmpty()) text else "$system\n\nUser says: $text", images))
         }
-        val model = if (images.isEmpty()) settings.fastModel else settings.visionModel
-        val full = streamReply(api, msgs, 1500, model)
+        val models = if (images.isEmpty()) settings.fastCandidates() else settings.visionCandidates()
+        val full = streamReply(api, msgs, 1500, models)
         generalTurns.add(Turn(text, full))
     }
 
@@ -273,7 +273,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         status = "Kimi is writing code…"
         var chars = 0
         var shown = 0
-        val raw = api.streamChat(settings.chatModel, msgs, settings.effort) { piece ->
+        val raw = api.streamChatAuto(settings.mainCandidates(), msgs, settings.effort) { piece ->
             chars += piece.length
             if (chars - shown > 150) {
                 shown = chars
@@ -341,9 +341,35 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         if (att != null && att.kind == AttachKind.IMAGE) {
             status = "Reading your image…"
             val data = withContext(Dispatchers.IO) { MediaUtils.imageDataUri(ctx, att.uri, 1024) }
+            val instruction = text.ifBlank { "Enhance this image" }
             status = "FLUX Kontext is editing your image…"
-            bytes = api.editImage(text.ifBlank { "Enhance this image" }, data)
-            label = "Edited with FLUX Kontext"
+            val edited = try {
+                api.editImage(instruction, data)
+            } catch (e: ApiException) {
+                // The free hosted API often refuses uploaded photos for editing: recreate instead.
+                if (e.code == 400 || e.code == 403 || e.code == 404 || e.code == 410 || e.code == 422) null else throw e
+            }
+            if (edited != null) {
+                bytes = edited
+                label = "Edited with FLUX Kontext"
+            } else {
+                status = "Describing your image…"
+                val desc = api.streamChatAuto(
+                    settings.visionCandidates(),
+                    listOf(
+                        ChatMsg(
+                            "user",
+                            "Describe this image in detail so an image generator can recreate it. Maximum 120 words, plain sentences, no dashes.",
+                            listOf(data)
+                        )
+                    ),
+                    "low",
+                    300
+                )
+                status = "FLUX is repainting it with your change…"
+                bytes = api.generateImage("${desc.trim()}. Apply this change: $instruction", 1024, 1024)
+                label = "Recreated with your change. NVIDIA's free hosted API cannot edit uploaded photos directly."
+            }
         } else {
             val t = text.lowercase()
             val (w, h) = when {
@@ -376,8 +402,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
         status = "Kimi is planning the edit…"
         val prompt = "Request: ${text.ifBlank { "Make it look great" }}\nVideo duration: ${"%.1f".format(durSec)} seconds.\nSampled frames are attached in order."
-        val raw = api.streamChat(
-            settings.chatModel,
+        val raw = api.streamChatAuto(
+            settings.videoCandidates(),
             listOf(ChatMsg("system", Prompts.VIDEO), ChatMsg("user", prompt, frames)),
             "low"
         )
