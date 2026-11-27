@@ -1,9 +1,12 @@
 package com.nexorastudio.app
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.graphics.Canvas
+import android.media.AudioAttributes
+import android.media.AudioManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -12,6 +15,7 @@ import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
+import androidx.camera.core.Preview
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -29,8 +33,9 @@ import java.util.concurrent.atomic.AtomicInteger
 enum class LivePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
 /**
- * Live voice conversation: you talk, the AI answers out loud in your chosen accent.
- * The camera (background, no preview) and shared screen are sent as pictures with each question.
+ * Live voice conversation. The microphone stays on for the whole session (unless you mute it),
+ * so you can talk over the AI to interrupt it. The camera and shared screen are sent as pictures
+ * with each question.
  */
 class LiveViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -49,19 +54,26 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         private set
     var cameraOn by mutableStateOf(false)
         private set
+    var showPreview by mutableStateOf(false)
+        private set
     var frontCamera by mutableStateOf(false)
         private set
     var screenOn by mutableStateOf(false)
         private set
 
     private var active = false
+    private var recognizing = false
+    private var aiAudioInSession = false
     private var retries = 0
     private var recognizer: SpeechRecognizer? = null
+    private var restartTask: Runnable? = null
     private var turnJob: Job? = null
+    @Volatile private var turnId = 0
     private val history = mutableListOf<Pair<String, String>>()
 
     private val voice = LiveVoice(app) { main.post { onSpeechFinished() } }
     private val cameraFrames = CameraFrames(app)
+    private val beeps = BeepGuard(app)
 
     init {
         FrameHub.onScreenStopped = { main.post { screenOn = false } }
@@ -83,17 +95,25 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
             return
         }
         active = true
-        listen()
+        beeps.mute()
+        phase = if (muted) LivePhase.IDLE else LivePhase.LISTENING
+        ensureRecognizing()
     }
 
     fun end() {
         active = false
+        turnId++
         turnJob?.cancel()
         voice.stop()
+        restartTask?.let { main.removeCallbacks(it) }
         recognizer?.destroy()
         recognizer = null
+        recognizing = false
+        beeps.restore()
         cameraFrames.stop()
         cameraOn = false
+        showPreview = false
+        muted = false
         stopScreen()
         phase = LivePhase.IDLE
         heard = ""
@@ -111,40 +131,44 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
     fun tapOrb() {
         when {
             !active -> start()
-            phase == LivePhase.SPEAKING || phase == LivePhase.THINKING -> {
-                turnJob?.cancel()
-                voice.stop()
-                listen()
-            }
-            phase == LivePhase.IDLE && !muted -> listen()
+            phase == LivePhase.SPEAKING || phase == LivePhase.THINKING -> interruptNow()
         }
     }
 
     fun toggleMute() {
         muted = !muted
+        retries = 0
         if (muted) {
             recognizer?.cancel()
+            recognizing = false
             if (phase == LivePhase.LISTENING) phase = LivePhase.IDLE
-        } else if (active && phase == LivePhase.IDLE) {
-            listen()
+        } else if (active) {
+            if (phase == LivePhase.IDLE) phase = LivePhase.LISTENING
+            ensureRecognizing()
         }
     }
 
-    fun setCamera(on: Boolean, owner: LifecycleOwner) {
-        if (on) {
-            cameraFrames.start(owner, frontCamera) { ok, msg ->
-                cameraOn = ok
-                if (!ok) error = msg
-            }
-        } else {
+    fun setCamera(on: Boolean) {
+        cameraOn = on
+        if (!on) {
             cameraFrames.stop()
-            cameraOn = false
+            showPreview = false
         }
     }
 
-    fun flipCamera(owner: LifecycleOwner) {
-        frontCamera = !frontCamera
-        if (cameraOn) setCamera(true, owner)
+    fun flipCamera() { frontCamera = !frontCamera }
+
+    fun togglePreview() { showPreview = !showPreview }
+
+    /** Called by the screen whenever the camera, preview or lens changes. */
+    fun rebindCamera(owner: LifecycleOwner, provider: Preview.SurfaceProvider?) {
+        cameraFrames.start(owner, frontCamera, provider) { ok, msg ->
+            if (!ok) {
+                cameraOn = false
+                showPreview = false
+                error = msg
+            }
+        }
     }
 
     fun onScreenGranted(resultCode: Int, data: Intent) {
@@ -158,7 +182,10 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         screenOn = false
     }
 
-    // ------------------------------------------------------------------ listening
+    // ------------------------------------------------------------------ microphone (always on)
+
+    private fun first(b: Bundle?): String? =
+        b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
 
     private val listener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {}
@@ -169,22 +196,40 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         override fun onEvent(eventType: Int, params: Bundle?) {}
 
         override fun onPartialResults(partialResults: Bundle?) {
-            val t = partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
-            if (!t.isNullOrBlank() && phase == LivePhase.LISTENING) heard = t
+            val raw = first(partialResults) ?: return
+            val t = if (aiAudioInSession) stripEcho(raw) else raw
+            when (phase) {
+                LivePhase.LISTENING, LivePhase.IDLE -> if (t.isNotBlank()) heard = t
+                else -> if (isInterruption(t)) {
+                    interruptNow()
+                    if (t.isNotBlank()) heard = t
+                }
+            }
         }
 
         override fun onResults(results: Bundle?) {
+            recognizing = false
             retries = 0
-            if (!active) return
-            val t = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()?.trim().orEmpty()
-            if (t.isBlank()) restartListening(300) else handleUser(t)
+            val raw = first(results)?.trim().orEmpty()
+            scheduleRestart(120)
+            if (!active || raw.isBlank()) return
+            val t = if (aiAudioInSession) stripEcho(raw) else raw
+            if (t.isBlank()) return
+            when (phase) {
+                LivePhase.LISTENING, LivePhase.IDLE -> handleUser(t)
+                else -> if (isInterruption(t)) {
+                    interruptNow()
+                    handleUser(t)
+                }
+            }
         }
 
         override fun onError(errorCode: Int) {
-            if (!active || phase != LivePhase.LISTENING) return
+            recognizing = false
+            if (!active || muted) return
             when (errorCode) {
                 SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> restartListening(200)
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> scheduleRestart(150)
 
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
                     error = "Microphone permission is needed."
@@ -195,32 +240,34 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
                 SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
                     recognizer?.destroy()
                     recognizer = null
-                    restartListening(500)
+                    scheduleRestart(500)
                 }
 
                 else -> {
                     retries++
-                    if (retries > 6) {
+                    if (retries > 8) {
                         error = "Speech recognition keeps failing. Check your internet connection and try again."
                         active = false
                         phase = LivePhase.IDLE
                     } else {
-                        restartListening(800)
+                        scheduleRestart(800)
                     }
                 }
             }
         }
     }
 
-    private fun restartListening(delayMs: Long) {
-        main.postDelayed({ if (active && !muted && phase == LivePhase.LISTENING) listen() }, delayMs)
+    private fun scheduleRestart(delayMs: Long) {
+        restartTask?.let { main.removeCallbacks(it) }
+        val task = Runnable { ensureRecognizing() }
+        restartTask = task
+        main.postDelayed(task, delayMs)
     }
 
-    private fun listen() {
-        if (!active) return
-        if (muted) { phase = LivePhase.IDLE; return }
-        phase = LivePhase.LISTENING
-        heard = ""
+    private fun ensureRecognizing() {
+        if (!active || muted || recognizing) return
+        recognizing = true
+        aiAudioInSession = phase == LivePhase.SPEAKING
         val r = recognizer ?: SpeechRecognizer.createSpeechRecognizer(getApplication()).also {
             it.setRecognitionListener(listener)
             recognizer = it
@@ -235,26 +282,82 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         r.startListening(intent)
     }
 
+    // ------------------------------------------------------------------ interruption and echo handling
+
+    private fun norm(w: String): String = w.lowercase().filter { it.isLetterOrDigit() || it == '\'' }
+
+    private fun replyWords(): List<String> =
+        reply.split(Regex("\\s+")).map { norm(it) }.filter { it.isNotEmpty() }
+
+    private fun containsSeq(a: List<String>, s: List<String>): Boolean {
+        if (s.size > a.size) return false
+        for (i in 0..a.size - s.size) {
+            var ok = true
+            for (j in s.indices) {
+                if (a[i + j] != s[j]) { ok = false; break }
+            }
+            if (ok) return true
+        }
+        return false
+    }
+
+    /** Removes the start of the text if it is just the phone hearing the AI's own voice. */
+    private fun stripEcho(text: String): String {
+        val a = replyWords()
+        if (a.isEmpty()) return text
+        val u = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        var k = u.size
+        while (k > 0) {
+            val prefix = u.take(k).map { norm(it) }.filter { it.isNotEmpty() }
+            if (prefix.isNotEmpty() && containsSeq(a, prefix)) break
+            k--
+        }
+        return if (k >= 2 || (k > 0 && k == u.size)) u.drop(k).joinToString(" ") else text
+    }
+
+    private val stopWords = setOf("stop", "wait", "pause", "enough", "hold")
+
+    /** True when what the mic hears is the user talking, not the AI's voice coming back through the speaker. */
+    private fun isInterruption(text: String): Boolean {
+        val u = text.trim().split(Regex("\\s+")).map { norm(it) }.filter { it.isNotEmpty() }
+        if (u.isEmpty()) return false
+        if (phase == LivePhase.THINKING && reply.isBlank()) return true
+        val ref = replyWords().toSet()
+        val novel = u.count { it !in ref }
+        return novel >= 2 || (novel >= 1 && u.size <= 2 && u.any { it in stopWords })
+    }
+
+    private fun interruptNow() {
+        turnId++
+        turnJob?.cancel()
+        voice.stop()
+        phase = if (muted) LivePhase.IDLE else LivePhase.LISTENING
+    }
+
     // ------------------------------------------------------------------ answering
 
     private fun handleUser(text: String) {
+        turnJob?.cancel()
+        val turn = ++turnId
         heard = text
         reply = ""
         phase = LivePhase.THINKING
         turnJob = viewModelScope.launch {
             try {
-                respond(text)
+                respond(text, turn)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                error = e.message ?: e.toString()
-                voice.stop()
-                if (active) listen()
+                if (turn == turnId) {
+                    error = e.message ?: e.toString()
+                    voice.stop()
+                    phase = if (muted) LivePhase.IDLE else LivePhase.LISTENING
+                }
             }
         }
     }
 
-    private suspend fun respond(text: String) {
+    private suspend fun respond(text: String, turn: Int) {
         val api = NvidiaApi(settings.apiKey, settings)
         val tag = settings.accentTag
 
@@ -271,18 +374,22 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         }
         val models = if (frame == null) settings.fastCandidates() else settings.visionCandidates()
 
-        val voiceError = voice.begin(tag)
-        if (voiceError != null) main.post { error = voiceError }
+        val voiceError = voice.begin(tag, settings.voiceName)
+        if (voiceError != null) main.post { if (turn == turnId) error = voiceError }
 
         val sb = StringBuilder()
         val pending = StringBuilder()
         val full = api.streamChatAuto(models, msgs, "low", 400) { piece ->
+            if (turn != turnId) return@streamChatAuto
             sb.append(piece)
             pending.append(piece)
             val shown = ReplyStyle.clean(sb.toString())
             main.post {
-                reply = shown
-                if (phase == LivePhase.THINKING) phase = LivePhase.SPEAKING
+                if (turn == turnId) {
+                    reply = shown
+                    if (phase == LivePhase.THINKING) phase = LivePhase.SPEAKING
+                    aiAudioInSession = true
+                }
             }
             while (true) {
                 val end = sentenceEnd(pending)
@@ -292,9 +399,10 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
                 if (sentence.length > 1) voice.enqueue(ReplyStyle.clean(sentence))
             }
         }
+        if (turn != turnId) return
         if (pending.isNotBlank()) voice.enqueue(ReplyStyle.clean(pending.toString().trim()))
         history.add(text to full)
-        if (full.isBlank()) main.post { reply = "I did not catch that, please try again." }
+        if (full.isBlank()) main.post { if (turn == turnId) reply = "I did not catch that, please try again." }
         voice.finish()
     }
 
@@ -311,8 +419,11 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private fun onSpeechFinished() {
-        if (!active || phase == LivePhase.LISTENING || phase == LivePhase.IDLE) return
-        main.postDelayed({ if (active && phase != LivePhase.LISTENING) listen() }, 250)
+        if (!active) return
+        if (phase == LivePhase.SPEAKING || phase == LivePhase.THINKING) {
+            phase = if (muted) LivePhase.IDLE else LivePhase.LISTENING
+            ensureRecognizing()
+        }
     }
 
     // ------------------------------------------------------------------ what the AI sees
@@ -352,8 +463,34 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
     }
 }
 
+/**
+ * Silences the recognizer's start and stop beeps while the live screen is open.
+ * The AI voice plays on the call volume stream, so it is not affected. Everything is restored on exit.
+ */
+class BeepGuard(ctx: Context) {
+    private val am = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
+    private val muted = mutableListOf<Int>()
+
+    fun mute() {
+        if (muted.isNotEmpty()) return
+        for (s in listOf(AudioManager.STREAM_MUSIC, AudioManager.STREAM_NOTIFICATION, AudioManager.STREAM_SYSTEM)) {
+            runCatching {
+                if (!am.isStreamMute(s)) {
+                    am.adjustStreamVolume(s, AudioManager.ADJUST_MUTE, 0)
+                    muted.add(s)
+                }
+            }
+        }
+    }
+
+    fun restore() {
+        muted.forEach { s -> runCatching { am.adjustStreamVolume(s, AudioManager.ADJUST_UNMUTE, 0) } }
+        muted.clear()
+    }
+}
+
 /** Speaks a reply sentence by sentence while it is still being written, so answers start fast. */
-class LiveVoice(ctx: android.content.Context, private val onIdle: () -> Unit) {
+class LiveVoice(ctx: Context, private val onIdle: () -> Unit) {
     private var tts: TextToSpeech? = null
     private var ready = false
     private var voiceOk = false
@@ -364,6 +501,12 @@ class LiveVoice(ctx: android.content.Context, private val onIdle: () -> Unit) {
     init {
         tts = TextToSpeech(ctx.applicationContext) { status ->
             ready = status == TextToSpeech.SUCCESS
+            tts?.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {}
                 override fun onDone(utteranceId: String?) { utteranceDone() }
@@ -378,7 +521,7 @@ class LiveVoice(ctx: android.content.Context, private val onIdle: () -> Unit) {
     }
 
     /** Returns an error message if the accent voice is missing. */
-    fun begin(tag: String): String? {
+    fun begin(tag: String, voiceName: String): String? {
         finished = false
         pending.set(0)
         val t = tts
@@ -388,6 +531,7 @@ class LiveVoice(ctx: android.content.Context, private val onIdle: () -> Unit) {
             voiceOk = false
             return "This voice is not installed. Open Android Settings, Text to speech, and install ${Accents.name(tag)}."
         }
+        VoicePicker.apply(t, tag, voiceName)
         voiceOk = true
         t.stop()
         return null
@@ -417,6 +561,6 @@ class LiveVoice(ctx: android.content.Context, private val onIdle: () -> Unit) {
 }
 
 private fun livePrompt(languageRule: String): String = """
-You are NEXORA in a live voice conversation. The user talks to you and hears your answer out loud. Reply in one to three short, natural spoken sentences with simple words, like a friend on a call. No lists, no markdown, no emojis, and no dashes of any kind. When a picture is attached it shows what the user's camera sees right now or what is on their screen: use it naturally when it helps and never say that you received a picture. If you cannot see well, say so briefly.
+You are NEXORA in a live voice conversation. The user talks to you and hears your answer out loud. Reply in one to three short, natural spoken sentences with simple words, like a friend on a call. Use contractions and a relaxed, warm tone. No lists, no markdown, no emojis, and no dashes of any kind. When a picture is attached it shows what the user's camera sees right now or what is on their screen: use it naturally when it helps and never say that you received a picture. If you cannot see well, say so briefly.
 $languageRule
 """.trimIndent()
