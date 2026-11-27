@@ -38,15 +38,17 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
         model: String,
         messages: List<ChatMsg>,
         effort: String,
+        maxTokens: Int = 32000,
+        onThinking: () -> Unit = {},
         onDelta: (String) -> Unit = {}
     ): String = withContext(Dispatchers.IO) {
         val body = JSONObject().apply {
             put("model", model)
             put("messages", JSONArray().apply { messages.forEach { put(toJson(it)) } })
-            put("max_tokens", 32000)
+            put("max_tokens", maxTokens)
             put("temperature", 0.6)
             put("stream", true)
-            put("reasoning_effort", effort)
+            if (model.contains("kimi", ignoreCase = true)) put("reasoning_effort", effort)
         }
         val req = Request.Builder()
             .url(CHAT_URL)
@@ -55,16 +57,16 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
             .post(body.toString().toRequestBody(json))
             .build()
 
-        exec(req) { resp ->
+        val first = exec<Pair<String, String?>>(req) { resp ->
+            if (resp.code == 202) return@exec Pair<String, String?>("", resp.header("NVCF-REQID"))
             if (!resp.isSuccessful) throw ApiException(resp.code, resp.body?.string().orEmpty().take(400))
             val ct = resp.header("Content-Type").orEmpty()
             if (!ct.contains("event-stream")) {
-                // Server answered with a plain JSON completion instead of a stream.
                 val txt = resp.body?.string().orEmpty()
                 val msg = JSONObject(txt).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
                 val c = if (msg.isNull("content")) "" else msg.getString("content")
                 onDelta(c)
-                return@exec c
+                return@exec Pair<String, String?>(c, null)
             }
             val source = resp.body?.source() ?: throw ApiException(resp.code, "Empty response")
             val sb = StringBuilder()
@@ -77,6 +79,9 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
                 val delta = runCatching {
                     JSONObject(data).getJSONArray("choices").getJSONObject(0).optJSONObject("delta")
                 }.getOrNull() ?: continue
+                val thinking = (delta.has("reasoning_content") && !delta.isNull("reasoning_content")) ||
+                    (delta.has("reasoning") && !delta.isNull("reasoning"))
+                if (thinking) onThinking()
                 if (delta.isNull("content")) continue
                 val piece = delta.getString("content")
                 if (piece.isNotEmpty()) {
@@ -84,8 +89,31 @@ class NvidiaApi(private val apiKey: String, private val settings: AppSettings) {
                     onDelta(piece)
                 }
             }
-            sb.toString()
+            Pair<String, String?>(sb.toString(), null)
         }
+
+        val reqId = first.second ?: return@withContext first.first
+
+        // The server queued the request (HTTP 202): poll until it is ready.
+        var tries = 0
+        while (tries < 150) {
+            delay(2000)
+            tries++
+            val poll = Request.Builder()
+                .url(STATUS_URL + reqId)
+                .header("Authorization", "Bearer $apiKey")
+                .header("Accept", "application/json")
+                .get()
+                .build()
+            val r = exec(poll) { Pair(it.code, it.body?.string().orEmpty()) }
+            if (r.first == 202) { onThinking(); continue }
+            if (r.first !in 200..299) throw ApiException(r.first, r.second.take(400))
+            val msg = JSONObject(r.second).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+            val c = if (msg.isNull("content")) "" else msg.getString("content")
+            onDelta(c)
+            return@withContext c
+        }
+        throw ApiException(408, "The model took too long to answer. Please try again.")
     }
 
     private fun toJson(m: ChatMsg): JSONObject {
