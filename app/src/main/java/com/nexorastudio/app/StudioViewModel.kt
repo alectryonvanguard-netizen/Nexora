@@ -4,7 +4,10 @@ import android.app.Application
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.widget.Toast
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -16,6 +19,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
@@ -31,6 +35,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     val store = ProjectStore(app)
     private val videoEngine = VideoEngine(app)
     private val main = Handler(Looper.getMainLooper())
+
+    private val speaker = Speaker(app) { main.post { speakingId = null } }
 
     val items = mutableStateListOf<Msg>()
 
@@ -53,6 +59,14 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     var progress by mutableStateOf<Float?>(null)
         private set
 
+    /** Seconds since the current request started. Shown so you can see it is working. */
+    var elapsed by mutableIntStateOf(0)
+        private set
+
+    /** Id of the reply being read aloud, if any. */
+    var speakingId by mutableStateOf<Long?>(null)
+        private set
+
     private var job: Job? = null
     private var counter = 0L
     private fun nid() = counter++
@@ -61,6 +75,11 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private var lastVideo: Uri? = null
     private val codeTurns = mutableListOf<Turn>()
     private val generalTurns = mutableListOf<Turn>()
+
+    override fun onCleared() {
+        speaker.shutdown()
+        super.onCleared()
+    }
 
     // ------------------------------------------------------------------ user actions
 
@@ -72,6 +91,8 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     fun newChat() {
         job?.cancel()
+        speaker.stop()
+        speakingId = null
         items.clear()
         codeTurns.clear()
         generalTurns.clear()
@@ -89,32 +110,91 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val text = raw.trim()
         val att = attachment
         if ((text.isEmpty() && att == null) || busy) return
-        if (settings.apiKey.isBlank()) {
-            items.add(ErrorMsg(nid(), "Add your NVIDIA API key in Settings first (build.nvidia.com > Get API Key)."))
-            return
-        }
+        if (!hasKey()) return
 
         val mode = Router.route(text, att, manualMode)
         activeMode = mode
         items.add(UserMsg(nid(), text, att))
         attachment = null
 
+        launchWork(mode) { api ->
+            when (mode) {
+                Mode.CODE -> runCode(api, text, att)
+                Mode.VIDEO -> runVideo(api, text, att)
+                Mode.IMAGE -> runImage(api, text, att)
+                else -> runGeneral(api, text, att)
+            }
+        }
+    }
+
+    /** Translates one reply into another language and shows it as a new reply. */
+    fun translate(sourceText: String, tag: String) {
+        if (busy || !hasKey()) return
+        val lang = Accents.name(tag)
+        activeMode = Mode.GENERAL
+        launchWork(Mode.GENERAL) { api ->
+            status = "Translating to $lang…"
+            val msgs = listOf(
+                ChatMsg(
+                    "system",
+                    "You are a translator. Output only the translation into $lang, using natural wording for that region. Keep the same tone and meaning. Never use dashes of any kind, reword instead. Leave code blocks unchanged."
+                ),
+                ChatMsg("user", ReplyStyle.clean(sourceText))
+            )
+            streamReply(api, msgs, 3000, settings.fastModel)
+        }
+    }
+
+    fun toggleSpeak(id: Long, text: String) {
+        if (speakingId == id) {
+            speaker.stop()
+            speakingId = null
+            return
+        }
+        val err = speaker.speak(text, settings.accentTag)
+        if (err != null) toast(err) else speakingId = id
+    }
+
+    fun previewVoice() {
+        val err = speaker.speak(Accents.sample(settings.accentTag), settings.accentTag)
+        if (err != null) toast(err)
+    }
+
+    // ------------------------------------------------------------------ shared plumbing
+
+    private fun toast(msg: String) {
+        Toast.makeText(getApplication(), msg, Toast.LENGTH_LONG).show()
+    }
+
+    private fun hasKey(): Boolean {
+        if (settings.apiKey.isBlank()) {
+            items.add(ErrorMsg(nid(), "Add your NVIDIA API key in Settings first (build.nvidia.com, Get API Key)."))
+            return false
+        }
+        return true
+    }
+
+    private fun launchWork(mode: Mode, block: suspend (NvidiaApi) -> Unit) {
         job = viewModelScope.launch {
             busy = true
-            try {
-                val api = NvidiaApi(settings.apiKey, settings)
-                when (mode) {
-                    Mode.CODE -> runCode(api, text, att)
-                    Mode.VIDEO -> runVideo(api, text, att)
-                    Mode.IMAGE -> runImage(api, text, att)
-                    else -> runGeneral(api, text, att)
+            elapsed = 0
+            val ticker = launch {
+                while (true) {
+                    delay(1000)
+                    elapsed += 1
                 }
+            }
+            try {
+                block(NvidiaApi(settings.apiKey, settings))
             } catch (e: CancellationException) {
+                settleStreaming()
                 items.add(AiMsg(nid(), mode, "Stopped."))
                 throw e
             } catch (e: Exception) {
+                settleStreaming()
                 items.add(ErrorMsg(nid(), e.message ?: e.toString()))
             } finally {
+                ticker.cancel()
                 busy = false
                 status = ""
                 progress = null
@@ -122,31 +202,59 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    // ------------------------------------------------------------------ GENERAL
-
-    private suspend fun runGeneral(api: NvidiaApi, text: String, att: Attachment?) {
-        val images = imagesOf(att)
-        val msgs = buildList {
-            add(ChatMsg("system", Prompts.GENERAL))
-            generalTurns.takeLast(6).forEach { add(ChatMsg("user", it.user)); add(ChatMsg("assistant", it.assistant)) }
-            add(ChatMsg("user", text, images))
+    /** Removes empty typing bubbles and freezes partial replies after a stop or an error. */
+    private fun settleStreaming() {
+        var i = 0
+        while (i < items.size) {
+            val m = items[i]
+            if (m is AiMsg && m.streaming) {
+                if (m.text.isBlank()) { items.removeAt(i); continue }
+                items[i] = m.copy(streaming = false)
+            }
+            i++
         }
+    }
+
+    /** Streams one reply into the chat with a typing bubble. Returns the full text. */
+    private suspend fun streamReply(api: NvidiaApi, msgs: List<ChatMsg>, maxTokens: Int, model: String): String {
         status = "Thinking…"
         val id = nid()
         items.add(AiMsg(id, Mode.GENERAL, "", true))
         val idx = items.lastIndex
         val sb = StringBuilder()
         var last = 0L
-        val full = api.streamChat(settings.chatModel, msgs, settings.effort) { piece ->
+        val full = api.streamChat(
+            model = model,
+            messages = msgs,
+            effort = "low",
+            maxTokens = maxTokens,
+            onThinking = {}
+        ) { piece ->
             sb.append(piece)
-            val now = android.os.SystemClock.uptimeMillis()
+            val now = SystemClock.uptimeMillis()
             if (now - last > 120) {
                 last = now
                 val snapshot = sb.toString()
                 main.post { if (idx < items.size) items[idx] = AiMsg(id, Mode.GENERAL, snapshot, true) }
             }
         }
-        items[idx] = AiMsg(id, Mode.GENERAL, full.trim().ifEmpty { "(empty answer)" }, false)
+        items[idx] = AiMsg(id, Mode.GENERAL, full.trim().ifEmpty { "I have nothing to add, try asking another way." }, false)
+        return full
+    }
+
+    // ------------------------------------------------------------------ GENERAL
+
+    private suspend fun runGeneral(api: NvidiaApi, text: String, att: Attachment?) {
+        val images = imagesOf(att)
+        val system = Prompts.general(Accents.languageRule(settings))
+        // Vision models often reject a system message next to an image, so it goes into the user message.
+        val msgs = buildList {
+            if (images.isEmpty()) add(ChatMsg("system", system))
+            generalTurns.takeLast(6).forEach { add(ChatMsg("user", it.user)); add(ChatMsg("assistant", it.assistant)) }
+            add(ChatMsg("user", if (images.isEmpty()) text else "$system\n\nUser says: $text", images))
+        }
+        val model = if (images.isEmpty()) settings.fastModel else settings.visionModel
+        val full = streamReply(api, msgs, 1500, model)
         generalTurns.add(Turn(text, full))
     }
 
@@ -258,7 +366,7 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         if (att != null && att.kind == AttachKind.VIDEO) lastVideo = att.uri
         val uri = lastVideo
         if (uri == null) {
-            items.add(AiMsg(nid(), Mode.VIDEO, "Attach a video with the clip button, then tell me how to edit it. For example: trim the first 5 seconds, make it black and white and add the caption \"Road trip\"."))
+            items.add(AiMsg(nid(), Mode.VIDEO, "Attach a video with the clip button, then tell me how to edit it. For example: trim the first 5 seconds, make it black and white and add the caption Road trip."))
             return
         }
 
