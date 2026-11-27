@@ -34,6 +34,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
@@ -51,6 +52,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
 import java.io.File
+import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
 @Composable
@@ -89,6 +91,16 @@ fun SettingsScreen(vm: StudioViewModel, onBack: () -> Unit) {
     var steps by remember { mutableFloatStateOf(s.steps.toFloat()) }
     var accent by remember { mutableStateOf(s.accentTag) }
     var auto by remember { mutableStateOf(s.autoLanguage) }
+    var voice by remember { mutableStateOf(s.voiceName) }
+    var voiceOptions by remember(accent) { mutableStateOf(vm.voiceOptions(accent)) }
+    LaunchedEffect(accent) {
+        repeat(8) {
+            if (voiceOptions.isEmpty()) {
+                delay(400)
+                voiceOptions = vm.voiceOptions(accent)
+            }
+        }
+    }
 
     Column(Modifier.fillMaxSize().systemBarsPadding()) {
         TopBar("SETTINGS", onBack)
@@ -147,6 +159,26 @@ fun SettingsScreen(vm: StudioViewModel, onBack: () -> Unit) {
                 }
             }
             TextButton(onClick = { vm.previewVoice() }) { Text("TEST VOICE", color = Ink, letterSpacing = 2.sp) }
+
+            Text("VOICE", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
+            Text(
+                "Tap a voice to hear it. Voices marked natural sound the most human and may need internet. You can install more in Android Settings, Text to speech.",
+                color = InkDim, fontSize = 12.sp
+            )
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(
+                    selected = voice.isEmpty(),
+                    onClick = { voice = ""; s.voiceName = ""; vm.previewVoice() },
+                    label = { Text("Auto (best)") }
+                )
+                voiceOptions.forEach { o ->
+                    FilterChip(
+                        selected = voice == o.name,
+                        onClick = { voice = o.name; s.voiceName = o.name; vm.previewVoice() },
+                        label = { Text(o.label) }
+                    )
+                }
+            }
 
             Text("CODE REASONING EFFORT", color = InkDim, fontSize = 11.sp, letterSpacing = 2.sp)
             Row {
