@@ -14,6 +14,7 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -56,11 +57,15 @@ import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Translate
+import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -74,6 +79,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
@@ -107,6 +113,7 @@ import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -115,7 +122,7 @@ import java.io.File
 // =====================================================================================
 
 @Composable
-fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onPreview: (String) -> Unit) {
+fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onLive: () -> Unit, onPreview: (String) -> Unit) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -133,7 +140,7 @@ fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onPreview: (String
     }
 
     Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
-        Header(live, onNew = { vm.newChat() }, onSettings = onSettings)
+        Header(live, onNew = { vm.newChat() }, onSettings = onSettings, onLive = onLive)
         ModeStrip(vm.manualMode, live) { vm.manualMode = it }
 
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -151,7 +158,10 @@ fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onPreview: (String
             }
         }
 
-        if (vm.busy) StatusBar(vm.status, vm.progress) { vm.stop() }
+        if (vm.busy) {
+            val hint = if (vm.elapsed > 45) "\nStill waiting on NVIDIA. Tap STOP and try again, or pick a faster model in Settings." else ""
+            StatusBar("${vm.status} · ${vm.elapsed}s$hint", vm.progress) { vm.stop() }
+        }
 
         Composer(
             input = input,
@@ -171,7 +181,7 @@ fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onPreview: (String
 // =====================================================================================
 
 @Composable
-private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit) {
+private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit, onLive: () -> Unit) {
     val aura = LocalAura.current
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -191,6 +201,7 @@ private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit) {
             )
             Text("AI STUDIO  ·  ${mode.label.uppercase()}", color = InkDim, fontSize = 10.sp, letterSpacing = 3.sp)
         }
+        IconButton(onClick = onLive) { Icon(Icons.Default.GraphicEq, "Live conversation", tint = Ink) }
         IconButton(onClick = onNew) { Icon(Icons.Default.Add, "New chat", tint = Ink) }
         IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings", tint = Ink) }
     }
@@ -418,7 +429,7 @@ private fun EmptyState(onPick: (String) -> Unit) {
 private fun MsgView(m: Msg, vm: StudioViewModel, onPreview: (String) -> Unit) {
     when (m) {
         is UserMsg -> UserBubble(m)
-        is AiMsg -> AiBubble(m)
+        is AiMsg -> AiBubble(m, vm)
         is ProjectMsg -> ProjectCard(m, vm, onPreview)
         is ImageMsg -> ImageCard(m, vm)
         is VideoMsg -> VideoCard(m)
@@ -463,12 +474,101 @@ private fun ModeTag(mode: Mode) {
 }
 
 @Composable
-private fun AiBubble(m: AiMsg) {
+private fun AiBubble(m: AiMsg, vm: StudioViewModel) {
+    // Replies appear gradually, like someone typing. Old messages show instantly.
+    var shown by remember(m.id) { mutableIntStateOf(if (m.streaming) 0 else m.text.length) }
+    LaunchedEffect(m.text) {
+        while (shown < m.text.length) {
+            val lag = m.text.length - shown
+            shown = minOf(m.text.length, shown + maxOf(1, lag / 10))
+            delay(16)
+        }
+    }
+    val done = !m.streaming && shown >= m.text.length
+    val visible = m.text.take(shown)
+
     Glass(Modifier.fillMaxWidth(), radius = 20.dp) {
         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
             ModeTag(m.mode)
-            if (m.text.isBlank() && m.streaming) Text("…", color = InkDim) else RichText(m.text)
+            if (visible.isBlank()) {
+                if (!done) TypingDots() else Text("(empty)", color = InkDim)
+            } else {
+                RichText(visible)
+            }
+            if (done && m.text.isNotBlank()) ReplyActions(m, vm)
         }
+    }
+}
+
+@Composable
+private fun TypingDots() {
+    val aura = LocalAura.current
+    val t = rememberInfiniteTransition(label = "dots")
+    val p = t.animateFloat(
+        initialValue = 0f,
+        targetValue = 3f,
+        animationSpec = infiniteRepeatable(tween(1200, easing = LinearEasing)),
+        label = "p"
+    )
+    Canvas(Modifier.size(width = 48.dp, height = 20.dp)) {
+        for (i in 0..2) {
+            val phase = (((p.value - i) % 3f) + 3f) % 3f
+            val a = if (phase < 1f) 0.35f + 0.65f * (1f - kotlin.math.abs(phase - 0.5f) * 2f) else 0.35f
+            drawCircle(
+                aura.c1.copy(alpha = a),
+                radius = 4.dp.toPx(),
+                center = Offset(8.dp.toPx() + i * 14.dp.toPx(), size.height / 2f)
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReplyActions(m: AiMsg, vm: StudioViewModel) {
+    val ctx = LocalContext.current
+    val clipboard = LocalClipboardManager.current
+    var menu by remember { mutableStateOf(false) }
+    val speaking = vm.speakingId == m.id
+    val clean = remember(m.text) { ReplyStyle.clean(m.text) }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(2.dp), verticalAlignment = Alignment.CenterVertically) {
+        ActionChip("Copy", Icons.Default.ContentCopy) {
+            clipboard.setText(AnnotatedString(clean))
+            Toast.makeText(ctx, "Copied", Toast.LENGTH_SHORT).show()
+        }
+        ActionChip(if (speaking) "Stop" else "Listen", if (speaking) Icons.Default.Stop else Icons.Default.VolumeUp) {
+            vm.toggleSpeak(m.id, clean)
+        }
+        Box {
+            ActionChip("Translate", Icons.Default.Translate) { menu = true }
+            DropdownMenu(
+                expanded = menu,
+                onDismissRequest = { menu = false },
+                modifier = Modifier.heightIn(max = 360.dp)
+            ) {
+                Accents.tags.forEach { tag ->
+                    DropdownMenuItem(
+                        text = { Text(Accents.name(tag)) },
+                        onClick = { menu = false; vm.translate(m.text, tag) }
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActionChip(label: String, icon: ImageVector, onClick: () -> Unit) {
+    Row(
+        Modifier
+            .clip(RoundedCornerShape(10.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Icon(icon, null, tint = InkDim, modifier = Modifier.size(16.dp))
+        Spacer(Modifier.width(5.dp))
+        Text(label, color = InkDim, fontSize = 12.sp)
     }
 }
 
@@ -490,7 +590,7 @@ private fun RichText(text: String) {
         parts.forEachIndexed { i, part ->
             if (i % 2 == 0) {
                 if (part.isNotBlank()) {
-                    SelectionContainer { Text(part.trim(), color = Ink, fontSize = 15.sp, lineHeight = 22.sp) }
+                    SelectionContainer { Text(ReplyStyle.prose(part).trim(), color = Ink, fontSize = 15.sp, lineHeight = 22.sp) }
                 }
             } else {
                 val lang = if (part.contains('\n')) part.substringBefore('\n').trim() else ""
