@@ -269,14 +269,14 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
             if (frame == null) add(ChatMsg("user", text))
             else add(ChatMsg("user", "$system\n\n$note\n\nUser says: $text", listOf(frame)))
         }
-        val model = if (frame == null) settings.fastModel else settings.visionModel
+        val models = if (frame == null) settings.fastCandidates() else settings.visionCandidates()
 
         val voiceError = voice.begin(tag)
         if (voiceError != null) main.post { error = voiceError }
 
         val sb = StringBuilder()
         val pending = StringBuilder()
-        val full = api.streamChat(model, msgs, "low", 400) { piece ->
+        val full = api.streamChatAuto(models, msgs, "low", 400) { piece ->
             sb.append(piece)
             pending.append(piece)
             val shown = ReplyStyle.clean(sb.toString())
