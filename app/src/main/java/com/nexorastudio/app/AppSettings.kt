@@ -72,6 +72,11 @@ class AppSettings(ctx: Context) {
         get() = str("accent", "en-US")
         set(v) { sp.edit().putString("accent", v).apply() }
 
+    /** Name of the chosen voice. Empty means pick the best one automatically. */
+    var voiceName: String
+        get() = sp.getString("voice", "") ?: ""
+        set(v) { sp.edit().putString("voice", v).apply() }
+
     var autoLanguage: Boolean
         get() = sp.getBoolean("auto_lang", true)
         set(v) { sp.edit().putBoolean("auto_lang", v).apply() }
