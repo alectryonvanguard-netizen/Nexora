@@ -1,4 +1,3 @@
-
 package com.nexorastudio.app
 
 import android.app.Application
@@ -35,7 +34,6 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     val settings = AppSettings(app)
     val store = ProjectStore(app)
     private val historyStore = HistoryStore(app)
-
     private val videoEngine = VideoEngine(app)
     private val main = Handler(Looper.getMainLooper())
 
@@ -75,28 +73,11 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     private fun nid() = counter++
 
     private var currentProject: File? = null
+    private var chatId: String? = null
+    private var silent = false
     private var lastVideo: Uri? = null
     private val codeTurns = mutableListOf<Turn>()
     private val generalTurns = mutableListOf<Turn>()
-
-    // ------------------------------------------------------------------ HISTORY
-
-    fun historyEntries(): List<HistoryEntry> = historyStore.list()
-
-    fun deleteChat(id: String) {
-        historyStore.delete(id)
-    }
-
-    fun openChat(id: String): Boolean {
-        val chat = historyStore.load(id) ?: return false
-
-        newChat()
-        items.addAll(chat.messages)
-
-        counter = (chat.messages.maxOfOrNull { it.id } ?: -1L) + 1L
-
-        return true
-    }
 
     override fun onCleared() {
         speaker.shutdown()
@@ -112,7 +93,10 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
     fun clearAttachment() { attachment = null }
 
     fun newChat() {
+        persist()
+        if (job?.isActive == true) silent = true
         job?.cancel()
+        chatId = null
         speaker.stop()
         speakingId = null
         items.clear()
@@ -132,12 +116,25 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         val text = raw.trim()
         val att = attachment
         if ((text.isEmpty() && att == null) || busy) return
+
+        // Teaching commands (/teach, /ssa, ...) run on the phone and need no API.
+        if (text.startsWith("/") && att == null) {
+            val answer = SsaCommands.handle(getApplication(), settings, text)
+            if (answer != null) {
+                items.add(UserMsg(nid(), text, null))
+                items.add(AiMsg(nid(), Mode.GENERAL, answer, false))
+                persist()
+                return
+            }
+        }
         if (!hasKey()) return
 
-        val mode = Router.route(text, att, manualMode)
+        val mode = if (settings.ssaMode && manualMode == Mode.AUTO && att == null) Mode.GENERAL
+        else Router.route(text, att, manualMode)
         activeMode = mode
         items.add(UserMsg(nid(), text, att))
         attachment = null
+        persist()
 
         launchWork(mode) { api ->
             when (mode) {
@@ -184,6 +181,69 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
         if (err != null) toast(err)
     }
 
+    // ------------------------------------------------------------------ history and notifications
+
+    fun historyEntries(): List<HistoryEntry> = historyStore.list()
+
+    fun deleteChat(id: String) {
+        historyStore.delete(id)
+        if (id == chatId) chatId = null
+    }
+
+    fun openChat(id: String) {
+        val chat = historyStore.load(id) ?: return
+        if (job?.isActive == true) silent = true
+        job?.cancel()
+        speaker.stop()
+        speakingId = null
+        items.clear()
+        items.addAll(chat.messages)
+        chatId = chat.id
+        currentProject = chat.project?.let { File(store.root, it) }?.takeIf { it.exists() }
+        counter = (chat.messages.maxOfOrNull { it.id } ?: 0L) + 1
+        codeTurns.clear()
+        generalTurns.clear()
+        var lastUser: UserMsg? = null
+        for (m in chat.messages) {
+            if (m is UserMsg) {
+                lastUser = m
+            } else if (m is AiMsg && m.mode == Mode.GENERAL && lastUser != null) {
+                generalTurns.add(Turn(lastUser.text, m.text))
+                lastUser = null
+            }
+        }
+        lastVideo = null
+        attachment = null
+        busy = false
+        status = ""
+        progress = null
+    }
+
+    /** Saves the current chat to history (runs in the background). */
+    private fun persist() {
+        val msgs = items.toList().filterNot { it is AiMsg && it.streaming }
+        val first = msgs.firstOrNull { it is UserMsg } as? UserMsg ?: return
+        val id = chatId ?: System.currentTimeMillis().toString().also { chatId = it }
+        val title = first.text.trim().take(40).ifBlank { "Chat" }
+        val project = currentProject?.name
+        val chat = SavedChat(id, title, System.currentTimeMillis(), project, msgs)
+        viewModelScope.launch(Dispatchers.IO) { runCatching { historyStore.save(chat) } }
+    }
+
+    /** When you are away from the app, the reply itself shows up as a notification. */
+    private fun notifyIfAway() {
+        if (AppState.visible) return
+        val text = when (val m = items.lastOrNull()) {
+            is AiMsg -> ReplyStyle.clean(m.text)
+            is ProjectMsg -> m.text
+            is ImageMsg -> m.text
+            is VideoMsg -> m.text
+            is ErrorMsg -> m.text
+            else -> null
+        }
+        if (!text.isNullOrBlank()) Notifier.reply(getApplication(), text)
+    }
+
     // ------------------------------------------------------------------ shared plumbing
 
     private fun toast(msg: String) {
@@ -200,8 +260,10 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun launchWork(mode: Mode, block: suspend (NvidiaApi) -> Unit) {
         job = viewModelScope.launch {
+            silent = false
             busy = true
             elapsed = 0
+            WorkService.start(getApplication())
             val ticker = launch {
                 while (true) {
                     delay(1000)
@@ -210,18 +272,22 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
             }
             try {
                 block(NvidiaApi(settings.apiKey, settings))
+                notifyIfAway()
             } catch (e: CancellationException) {
                 settleStreaming()
-                items.add(AiMsg(nid(), mode, "Stopped."))
+                if (!silent) items.add(AiMsg(nid(), mode, "Stopped."))
                 throw e
             } catch (e: Exception) {
                 settleStreaming()
                 items.add(ErrorMsg(nid(), e.message ?: e.toString()))
+                notifyIfAway()
             } finally {
                 ticker.cancel()
                 busy = false
                 status = ""
                 progress = null
+                WorkService.stop(getApplication())
+                persist()
             }
         }
     }
@@ -270,14 +336,21 @@ class StudioViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun runGeneral(api: NvidiaApi, text: String, att: Attachment?) {
         val images = imagesOf(att)
-        val system = Prompts.general(Accents.languageRule(settings))
+        val ssa = settings.ssaMode
+        val system = if (ssa) SsaLanguage.systemPrompt(LexiconStore(getApplication()).all())
+        else Prompts.general(Accents.languageRule(settings))
         // Vision models often reject a system message next to an image, so it goes into the user message.
         val msgs = buildList {
             if (images.isEmpty()) add(ChatMsg("system", system))
             generalTurns.takeLast(6).forEach { add(ChatMsg("user", it.user)); add(ChatMsg("assistant", it.assistant)) }
             add(ChatMsg("user", if (images.isEmpty()) text else "$system\n\nUser says: $text", images))
         }
-        val models = if (images.isEmpty()) settings.fastCandidates() else settings.visionCandidates()
+        // SSA follows rules better on the main model, so it goes first (a bit slower).
+        val models = when {
+            images.isNotEmpty() -> settings.visionCandidates()
+            ssa -> (listOf(settings.chatModel) + settings.fastCandidates()).distinct()
+            else -> settings.fastCandidates()
+        }
         val full = streamReply(api, msgs, 1500, models)
         generalTurns.add(Turn(text, full))
     }
