@@ -77,6 +77,11 @@ class AppSettings(ctx: Context) {
         get() = sp.getString("voice", "") ?: ""
         set(v) { sp.edit().putString("voice", v).apply() }
 
+    /** When on, the AI speaks Native Language A (SSA) using the poster rules and the words you taught it. */
+    var ssaMode: Boolean
+        get() = sp.getBoolean("ssa_mode", false)
+        set(v) { sp.edit().putBoolean("ssa_mode", v).apply() }
+
     var autoLanguage: Boolean
         get() = sp.getBoolean("auto_lang", true)
         set(v) { sp.edit().putBoolean("auto_lang", v).apply() }
