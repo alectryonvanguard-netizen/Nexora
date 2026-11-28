@@ -118,6 +118,10 @@ class LiveViewModel(app: Application) : AndroidViewModel(app) {
         phase = LivePhase.IDLE
         heard = ""
         reply = ""
+        if (history.isNotEmpty()) {
+            HistoryStore(getApplication()).saveTranscript(history.toList())
+            history.clear()
+        }
     }
 
     override fun onCleared() {
