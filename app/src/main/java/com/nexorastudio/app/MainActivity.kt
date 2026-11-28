@@ -12,6 +12,9 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -23,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.ViewModelStoreOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -35,6 +39,7 @@ class MainActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        installSplashScreen()
         super.onCreate(savedInstanceState)
         enableEdgeToEdge(
             statusBarStyle = SystemBarStyle.dark(AndroidColor.TRANSPARENT),
@@ -74,6 +79,7 @@ private fun appStudioViewModel(): StudioViewModel {
 fun NexoraApp(vm: StudioViewModel = appStudioViewModel(), live: LiveViewModel = viewModel()) {
     var screen by rememberSaveable { mutableStateOf(Screen.STUDIO) }
     var project by rememberSaveable { mutableStateOf("") }
+    var booting by rememberSaveable { mutableStateOf(!BootState.shown) }
 
     BackHandler(enabled = screen != Screen.STUDIO) { screen = Screen.STUDIO }
 
@@ -98,6 +104,12 @@ fun NexoraApp(vm: StudioViewModel = appStudioViewModel(), live: LiveViewModel = 
                     onBack = { screen = Screen.STUDIO },
                     onOpen = { id -> vm.openChat(id); screen = Screen.STUDIO }
                 )
+            }
+            AnimatedVisibility(visible = booting, exit = fadeOut(tween(600))) {
+                BootScreen {
+                    BootState.shown = true
+                    booting = false
+                }
             }
         }
     }
