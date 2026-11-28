@@ -4,4 +4,11 @@
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
     </style>
+
+    <!-- System splash: plain dark screen with no icon, so it never repeats the app icon. -->
+    <style name="Theme.Nexora.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/void_bg</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/splash_blank</item>
+        <item name="postSplashScreenTheme">@style/Theme.Nexora</item>
+    </style>
 </resources>
