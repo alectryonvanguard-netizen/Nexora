@@ -58,6 +58,7 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Image
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
@@ -122,7 +123,7 @@ import java.io.File
 // =====================================================================================
 
 @Composable
-fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onLive: () -> Unit, onPreview: (String) -> Unit) {
+fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onLive: () -> Unit, onHistory: () -> Unit, onPreview: (String) -> Unit) {
     var input by remember { mutableStateOf("") }
     val listState = rememberLazyListState()
 
@@ -140,7 +141,7 @@ fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onLive: () -> Unit
     }
 
     Column(Modifier.fillMaxSize().systemBarsPadding().imePadding()) {
-        Header(live, onNew = { vm.newChat() }, onSettings = onSettings, onLive = onLive)
+        Header(live, onNew = { vm.newChat() }, onSettings = onSettings, onLive = onLive, onHistory = onHistory)
         ModeStrip(vm.manualMode, live) { vm.manualMode = it }
 
         Box(Modifier.weight(1f).fillMaxWidth()) {
@@ -181,7 +182,7 @@ fun StudioScreen(vm: StudioViewModel, onSettings: () -> Unit, onLive: () -> Unit
 // =====================================================================================
 
 @Composable
-private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit, onLive: () -> Unit) {
+private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit, onLive: () -> Unit, onHistory: () -> Unit) {
     val aura = LocalAura.current
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
@@ -201,9 +202,10 @@ private fun Header(mode: Mode, onNew: () -> Unit, onSettings: () -> Unit, onLive
             )
             Text("AI STUDIO  ·  ${mode.label.uppercase()}", color = InkDim, fontSize = 10.sp, letterSpacing = 3.sp)
         }
-        IconButton(onClick = onLive) { Icon(Icons.Default.GraphicEq, "Live conversation", tint = Ink) }
-        IconButton(onClick = onNew) { Icon(Icons.Default.Add, "New chat", tint = Ink) }
-        IconButton(onClick = onSettings) { Icon(Icons.Default.Settings, "Settings", tint = Ink) }
+        IconButton(onClick = onHistory, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.History, "History", tint = Ink) }
+        IconButton(onClick = onLive, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.GraphicEq, "Live conversation", tint = Ink) }
+        IconButton(onClick = onNew, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Add, "New chat", tint = Ink) }
+        IconButton(onClick = onSettings, modifier = Modifier.size(40.dp)) { Icon(Icons.Default.Settings, "Settings", tint = Ink) }
     }
 }
 
